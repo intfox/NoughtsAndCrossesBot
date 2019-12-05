@@ -1,5 +1,5 @@
 import canoe.api._
-import canoe.models.Chat
+import canoe.models.{Chat, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove}
 import canoe.models.messages.{TelegramMessage, TextMessage}
 import canoe.syntax._
 import cats.Monad
@@ -9,6 +9,7 @@ import cats.effect._
 import cats.syntax.functor._
 //import cats.implicits._
 import fs2.Stream
+import HelperFunction._
 
 import scala.language.higherKinds
 //import scala.concurrent.ExecutionContext
@@ -51,7 +52,7 @@ object NoughtsAndCrossesService {
   class ErrorIncorrectCell extends Throwable("Incorrect Cell")
 }
 
-case class StartedGame(playerUser: Player, user: MVar[IO, (Int, Int)], enemy: MVar[IO, (Int, Int)], playerMove: Ref[IO, Player], filed: Ref[IO, Array[Array[Option[Player]]]])
+case class StartedGame(playerUser: Player, user: MVar[IO, (Int, Int)], enemy: MVar[IO, (Int, Int)], playerMove: Ref[IO, Player], filed: Ref[IO, Seq[Seq[Option[Player]]]])
 
 private class NoughtsAndCrossesServiceImpl(private val searchQueue: MVar[IO, Deferred[IO, StartedGame]])(implicit val concurrent: Concurrent[IO]) extends NoughtsAndCrossesService[IO] {
   type Game = StartedGame
@@ -62,19 +63,17 @@ private class NoughtsAndCrossesServiceImpl(private val searchQueue: MVar[IO, Def
       game <- optionDeferredGame match {
         case Some(value) =>
           for {
-            _ <- IO{ println("Противник найден.") }
             randomBoolPlayerMove <- IO{new java.util.Random().nextBoolean()}
             user <- MVar.empty[IO, (Int, Int)]
             enemy <- MVar.empty[IO, (Int, Int)]
             playerMove <- Ref.of[IO, Player](if (randomBoolPlayerMove) Crosses else Noughts)
             randomBoolUserPlayerType <- IO{new java.util.Random().nextBoolean()}
-            gameField <- Ref.of(Array.fill(3)(Array.fill(3)( None: Option[Player] )))
+            gameField <- Ref.of(Seq.fill(3)(Seq.fill(3)( None: Option[Player] )))
             game = StartedGame(if (randomBoolUserPlayerType) Crosses else Noughts, user, enemy, playerMove, gameField)
             _ <- value.complete(game)
           } yield game
         case None =>
           for {
-            _ <- IO{println("Противник не найден")}
             deferredGame <- Deferred[IO, Game]
             _ <- searchQueue.put(deferredGame)
             startedGame <- deferredGame.get
@@ -82,11 +81,28 @@ private class NoughtsAndCrossesServiceImpl(private val searchQueue: MVar[IO, Def
       }
     } yield game
 
-  private def checkCorrectCell(cell: (Int, Int), gameFiled: Array[Array[Option[Player]]]): Either[Throwable, (Int, Int)] =
+  private def checkCorrectCell(cell: (Int, Int), gameFiled: Seq[Seq[Option[Player]]]): Either[Throwable, (Int, Int)] =
     for {
       _ <- if(cell._1 < gameFiled.length && cell._1 >= 0 && cell._2 < gameFiled(0).length && cell._2 >= 0) Right(cell) else Left( new NoughtsAndCrossesService.ErrorIncorrectCell )
       _ <- if(gameFiled(cell._1)(cell._2).isEmpty) Right(cell) else Left(new NoughtsAndCrossesService.ErrorIncorrectCell)
     } yield cell
+
+  private def checkWinGame(field: Seq[Seq[Option[Player]]] ): Option[Player] = {
+    def check(player: Player): Boolean = {
+      List(
+        field(0).forall(_.contains(player)),
+        field(1).forall(_.contains(player)),
+        field(2).forall(_.contains(player)),
+        field.map(_(0)).forall(_.contains(player)),
+        field.map(_(1)).forall(_.contains(player)),
+        field.map(_(2)).forall(_.contains(player)),
+        field(0)(0).contains(player) && field(1)(1).contains(player) && field(2)(2).contains(player),
+        field(0)(2).contains(player) && field(1)(1).contains(player) && field(2)(0).contains(player)).exists( identity )
+    }
+    if(check(Crosses)) Some(Crosses)
+    else if(check(Noughts)) Some(Noughts)
+    else None
+  }
 
   override def move(game: Game): IO[Move] =
     for {
@@ -98,14 +114,27 @@ private class NoughtsAndCrossesServiceImpl(private val searchQueue: MVar[IO, Def
               field <- game.filed.get
               cell <- IO.fromEither(checkCorrectCell(cell, field))
               _ <- game.playerMove.update( _.reverse )
+              field <- game.filed.modify{ field =>
+                val nextField = updatedMatrix(field)( cell._1, cell._2 )(Some(game.playerUser))
+                (nextField, nextField)
+              }
               res <- game.user.put(cell)
-            } yield Right(res)
+            } yield checkWinGame(field) match {
+              case Some(game.playerUser) => Left(Win)
+              case Some(_) => Left(Lose)
+              case None => Right(res)
+            }
         }
         case _ => new EnemyMove {
           override def apply(): IO[Either[EndGame, (Int, Int)]] =
             for {
               cell <- game.enemy.take
-            } yield Right(cell)
+              field <- game.filed.get
+            } yield checkWinGame(field) match {
+              case Some(game.playerUser) => Left(Win)
+              case Some(_) => Left(Lose)
+              case None => Right(cell)
+            }
         }
       }
     } yield move
@@ -113,8 +142,16 @@ private class NoughtsAndCrossesServiceImpl(private val searchQueue: MVar[IO, Def
 //  override def move(game: Game): IO[Move] = ???
 }
 
+trait Print[F[_]]{
+  def print( elem: String ): F[Unit]
+}
+
+
 object NoughtsAndCressesBot extends IOApp {
 
+  implicit val printIo = new Print[IO] {
+    def print( elem: String ) = IO{println(elem)}
+  }
 
   def run(args: List[String]): IO[ExitCode] =
     Stream
@@ -124,12 +161,14 @@ object NoughtsAndCressesBot extends IOApp {
       }}
       .compile.drain.as(ExitCode.Success)
 
-  def start[F[_]: TelegramClient](noughtsAndCrossesService: NoughtsAndCrossesService[F]): Scenario[F, Unit] =
+  def start[F[_]: TelegramClient : Print](noughtsAndCrossesService: NoughtsAndCrossesService[F]): Scenario[F, Unit] =
     for {
       chat <- Scenario.start(command("start").chat)
+      _ <- Scenario.eval( chat.send( "Поиск противника" ) )
       gameN <- Scenario.eval(noughtsAndCrossesService.startGame)
+      _ <- Scenario.eval( chat.send( "Протиник найден" , replyMarkup = Some(clearField)) )
       end <- gameCicle(noughtsAndCrossesService, chat).apply(gameN)
-      _ <- Scenario.eval( chat.send(s"You ${if(end == Win) "win" else "lose"}!") )
+      _ <- Scenario.eval( chat.send(s"Вы ${if(end == Win) "выйграли" else "проиграли"}!") )
     } yield ()
 
   private val coordinate = ((tmsg: TelegramMessage) => tmsg match {
@@ -140,23 +179,34 @@ object NoughtsAndCressesBot extends IOApp {
     case _ => None
   }).unlift
 
-  def gameCicle[F[_]: TelegramClient](noughtsAndCrossesService: NoughtsAndCrossesService[F], chat: Chat): noughtsAndCrossesService.Game => Scenario[F, EndGame] =
+  private val clearField: ReplyKeyboardMarkup = ReplyKeyboardMarkup((0 until 3).map(i => (0 until 3).map(j => KeyboardButton.text(s"$i $j") ) ))
+
+
+
+  def gameCicle[F[_]: TelegramClient : Print](noughtsAndCrossesService: NoughtsAndCrossesService[F], chat: Chat, field: ReplyKeyboardMarkup = clearField ): noughtsAndCrossesService.Game => Scenario[F, EndGame] =
     game => for {
       move <- Scenario.eval(noughtsAndCrossesService.move(game))
       move <- move match {
         case userMove: noughtsAndCrossesService.UserMove =>
           for {
+            _ <- Scenario.eval( chat.send("Ваш ход", replyMarkup = Some(field)) )
             userInput <- Scenario.next(coordinate)
             end <- Scenario.eval(userMove.apply(userInput))
-          } yield end
+          } yield end.map( _ => field.copy(  keyboard = updatedMatrix(field.keyboard)(userInput._1, userInput._2)(KeyboardButton.text("X")) ))
         case enemyMove: noughtsAndCrossesService.EnemyMove =>
           for {
             move <- Scenario.eval(enemyMove.apply())
-            _ <- move.map( move => Scenario.eval( chat.send(s"Ход противника ${move._1} ${move._2}") ).void ).getOrElse( Scenario.done )
-            end = move.map( _ => ())
-          } yield end
+            _ <- move.map( move => Scenario.eval( chat.send(s"Ход противника ${move._1} ${move._2}", replyMarkup = Some(field)) ).void ).getOrElse( Scenario.done )
+          } yield move.map{ case (i, j) => field.copy( keyboard = updatedMatrix(field.keyboard)(i, j)(KeyboardButton.text("O")) )}
       }
-      end <- move.swap.map(Scenario.pure[F, EndGame]).getOrElse( gameCicle( noughtsAndCrossesService, chat ).apply(game) )
-    } yield end
+      end <- move match {
+        case Right(value) => gameCicle(noughtsAndCrossesService, chat, value).apply(game)
+        case Left(end) => Scenario.pure[F, EndGame](end)
+      }
+   } yield end
 
+}
+
+object HelperFunction {
+  def updatedMatrix[T](matrix: Seq[Seq[T]])(index1: Int, index2: Int)(elem: T): Seq[Seq[T]] = matrix.updated(index1, matrix(index1).updated(index2, elem))
 }
