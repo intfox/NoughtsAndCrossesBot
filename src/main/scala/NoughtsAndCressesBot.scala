@@ -61,26 +61,24 @@ private class NoughtsAndCrossesServiceImpl(private val searchQueue: MVar[IO, Def
       optionDeferredGame <- searchQueue.tryTake
       game <- optionDeferredGame match {
         case Some(value) =>
-          IO{ println("Противник найден.") }.flatMap{ _ => IO{new java.util.Random().nextBoolean()}.flatMap{ randomBoolPlayerMove =>
-            MVar.empty[IO, (Int, Int)].flatMap{ user =>
-              MVar.empty[IO, (Int, Int)].flatMap{ enemy =>
-                Ref.of[IO, Player](if (randomBoolPlayerMove) Crosses else Noughts).flatMap{ playerMove =>
-                  IO{new java.util.Random().nextBoolean()}.flatMap{ randomBoolUserPlayerType =>
-                    Ref.of(Array.fill(3)(Array.fill(3)( None: Option[Player] ))).flatMap{ gameField =>
-                      val game = StartedGame(if (randomBoolUserPlayerType) Crosses else Noughts, user, enemy, playerMove, gameField)
-                      value.complete(game).map( _ => game)
-                    }
-                  }
-                }
-              }
-            }
-          }}
+          for {
+            _ <- IO{ println("Противник найден.") }
+            randomBoolPlayerMove <- IO{new java.util.Random().nextBoolean()}
+            user <- MVar.empty[IO, (Int, Int)]
+            enemy <- MVar.empty[IO, (Int, Int)]
+            playerMove <- Ref.of[IO, Player](if (randomBoolPlayerMove) Crosses else Noughts)
+            randomBoolUserPlayerType <- IO{new java.util.Random().nextBoolean()}
+            gameField <- Ref.of(Array.fill(3)(Array.fill(3)( None: Option[Player] )))
+            game = StartedGame(if (randomBoolUserPlayerType) Crosses else Noughts, user, enemy, playerMove, gameField)
+            _ <- value.complete(game)
+          } yield game
         case None =>
-          IO{println("Противник не найден")}.flatMap{ _ => Deferred[IO, Game].flatMap { deferredGame =>
-            searchQueue.put(deferredGame).flatMap(_ => deferredGame.get).map{ startedGame =>
-              startedGame.copy(startedGame.playerUser.reverse, startedGame.enemy, startedGame.user)
-            }
-          }}
+          for {
+            _ <- IO{println("Противник не найден")}
+            deferredGame <- Deferred[IO, Game]
+            _ <- searchQueue.put(deferredGame)
+            startedGame <- deferredGame.get
+          } yield startedGame.copy(startedGame.playerUser.reverse, startedGame.enemy, startedGame.user)
       }
     } yield game
 
@@ -95,16 +93,19 @@ private class NoughtsAndCrossesServiceImpl(private val searchQueue: MVar[IO, Def
       playerMove <- game.playerMove.get
       move = playerMove match {
         case game.playerUser => new UserMove {
-          override def apply(cell: (Int, Int)): IO[Either[EndGame, Unit]] = game.filed.get.flatMap{ field =>
-            IO.fromEither(checkCorrectCell(cell, field)).flatMap{ cell =>
-              game.playerMove.update( _.reverse ).flatMap{ _ =>
-                game.user.put(cell).map( Right(_) )
-              }
-            }
-          }
+          override def apply(cell: (Int, Int)): IO[Either[EndGame, Unit]] =
+            for{
+              field <- game.filed.get
+              cell <- IO.fromEither(checkCorrectCell(cell, field))
+              _ <- game.playerMove.update( _.reverse )
+              res <- game.user.put(cell)
+            } yield Right(res)
         }
         case _ => new EnemyMove {
-          override def apply(): IO[Either[EndGame, (Int, Int)]] = game.enemy.take.map( Right(_) )
+          override def apply(): IO[Either[EndGame, (Int, Int)]] =
+            for {
+              cell <- game.enemy.take
+            } yield Right(cell)
         }
       }
     } yield move
@@ -118,7 +119,9 @@ object NoughtsAndCressesBot extends IOApp {
   def run(args: List[String]): IO[ExitCode] =
     Stream
       .resource(TelegramClient.global[IO](BotToken.token))
-      .flatMap { implicit client => Bot.polling[IO].follow(start(???)) }
+      .flatMap { implicit client => Stream.eval(NoughtsAndCrossesService.apply).flatMap{ service =>
+        Bot.polling[IO].follow(start(service))
+      }}
       .compile.drain.as(ExitCode.Success)
 
   def start[F[_]: TelegramClient](noughtsAndCrossesService: NoughtsAndCrossesService[F]): Scenario[F, Unit] =
