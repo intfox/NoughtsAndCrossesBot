@@ -2,7 +2,7 @@ import canoe.api._
 import canoe.models.{Chat, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove}
 import canoe.models.messages.{TelegramMessage, TextMessage}
 import canoe.syntax._
-import cats.Monad
+import cats.{Monad, MonadError}
 import cats.effect.concurrent.{Deferred, MVar, Ref}
 //import cats.effect.{ContextShift, ExitCode, IO, IOApp}
 import cats.effect._
@@ -147,7 +147,7 @@ trait Print[F[_]]{
 }
 
 
-object NoughtsAndCressesBot extends IOApp {
+object NoughtsAndCrossesBot extends IOApp {
 
   implicit val printIo = new Print[IO] {
     def print( elem: String ) = IO{println(elem)}
@@ -161,14 +161,18 @@ object NoughtsAndCressesBot extends IOApp {
       }}
       .compile.drain.as(ExitCode.Success)
 
-  def start[F[_]: TelegramClient : Print](noughtsAndCrossesService: NoughtsAndCrossesService[F]): Scenario[F, Unit] =
+  def start[F[_]: TelegramClient : Print ](noughtsAndCrossesService: NoughtsAndCrossesService[F])(implicit me: MonadError[F, Throwable]): Scenario[F, Unit] =
     for {
       chat <- Scenario.start(command("start").chat)
       _ <- Scenario.eval( chat.send( "Поиск противника" ) )
       gameN <- Scenario.eval(noughtsAndCrossesService.startGame)
       _ <- Scenario.eval( chat.send( "Протиник найден" , replyMarkup = Some(clearField)) )
-      end <- gameCicle(noughtsAndCrossesService, chat).apply(gameN)
-      _ <- Scenario.eval( chat.send(s"Вы ${if(end == Win) "выйграли" else "проиграли"}!") )
+      _ <- (for {
+        end <- gameCicle(noughtsAndCrossesService, chat).apply(gameN)
+        _ <- Scenario.eval( chat.send(s"Вы ${if(end == Win) "выйграли" else "проиграли"}!") )
+      } yield ()).handleErrorWith{ err =>
+        Scenario.eval( chat.send(s"Ошибка : ${err.getMessage}") ).flatMap( _ => Scenario.eval( implicitly[Print[F]].print( s" Error: ${err.getMessage} " ) ))
+      }
     } yield ()
 
   private val coordinate = ((tmsg: TelegramMessage) => tmsg match {
@@ -179,18 +183,25 @@ object NoughtsAndCressesBot extends IOApp {
     case _ => None
   }).unlift
 
+
   private val clearField: ReplyKeyboardMarkup = ReplyKeyboardMarkup((0 until 3).map(i => (0 until 3).map(j => KeyboardButton.text(s"$i $j") ) ))
 
+  private class ErrorIncorrectInput extends Throwable("Incorrect input")
 
+  private def strToCoordinate( str: String ): Either[ErrorIncorrectInput, (Int, Int)] = str.split(" ").map( _.toIntOption ) match {
+    case Array(Some(x), Some(y)) => Right((x, y))
+    case _ => Left(new ErrorIncorrectInput)
+  }
 
-  def gameCicle[F[_]: TelegramClient : Print](noughtsAndCrossesService: NoughtsAndCrossesService[F], chat: Chat, field: ReplyKeyboardMarkup = clearField ): noughtsAndCrossesService.Game => Scenario[F, EndGame] =
+  def gameCicle[F[_]: TelegramClient](noughtsAndCrossesService: NoughtsAndCrossesService[F], chat: Chat, field: ReplyKeyboardMarkup = clearField )(implicit me: MonadError[F, Throwable]): noughtsAndCrossesService.Game => Scenario[F, EndGame] =
     game => for {
       move <- Scenario.eval(noughtsAndCrossesService.move(game))
-      move <- move match {
+      move <- (move match {
         case userMove: noughtsAndCrossesService.UserMove =>
           for {
             _ <- Scenario.eval( chat.send("Ваш ход", replyMarkup = Some(field)) )
-            userInput <- Scenario.next(coordinate)
+            userInputText <- Scenario.next(text)
+            userInput <- Scenario.eval( me.fromEither(strToCoordinate(userInputText)) )
             end <- Scenario.eval(userMove.apply(userInput))
           } yield end.map( _ => field.copy(  keyboard = updatedMatrix(field.keyboard)(userInput._1, userInput._2)(KeyboardButton.text("X")) ))
         case enemyMove: noughtsAndCrossesService.EnemyMove =>
@@ -198,6 +209,10 @@ object NoughtsAndCressesBot extends IOApp {
             move <- Scenario.eval(enemyMove.apply())
             _ <- move.map( move => Scenario.eval( chat.send(s"Ход противника ${move._1} ${move._2}", replyMarkup = Some(field)) ).void ).getOrElse( Scenario.done )
           } yield move.map{ case (i, j) => field.copy( keyboard = updatedMatrix(field.keyboard)(i, j)(KeyboardButton.text("O")) )}
+      }).handleErrorWith{
+        case _ : ErrorIncorrectInput => Scenario.pure( Right(field) )
+        case _ : NoughtsAndCrossesService.ErrorIncorrectCell => Scenario.pure( Right(field) )
+        case err => Scenario.eval( me.raiseError(err) )
       }
       end <- move match {
         case Right(value) => gameCicle(noughtsAndCrossesService, chat, value).apply(game)
