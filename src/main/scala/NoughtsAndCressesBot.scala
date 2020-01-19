@@ -19,15 +19,6 @@ sealed trait EndGame
 case object Win extends EndGame
 case object Lose extends EndGame
 
-sealed trait Player extends Product {
-  def reverse: Player = this match {
-    case Crosses => Noughts
-    case Noughts => Crosses
-  }
-}
-case object Crosses extends Player// Крестики
-case object Noughts extends Player// Нолики
-
 trait NoughtsAndCrossesService[F[_]] {
   type Game
 
