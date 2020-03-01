@@ -1,12 +1,14 @@
-sealed trait Game
+sealed trait Game {
+  def field: IndexedSeq[IndexedSeq[Option[Player]]]
+}
 object Game {
   class On(val thatMove: Player, val field: IndexedSeq[IndexedSeq[Option[Player]]]) extends Game {
     def move(x: Int, y: Int): Game =
       if(fieldOut(x) || fieldOut(y)) this
       else if(field(x)(y).isDefined) this
       else field.updated(x, field(x).updated(y, Some(thatMove))) match {
-        case Win(player) => new Over(Some(player))
-        case Full() => new Over(None)
+        case nextField @ Win(player) => new Over(Some(player), nextField)
+        case nextField @ Full() => new Over(None, nextField)
         case nextField => new On(thatMove.reverse, nextField)
       }
 
@@ -21,11 +23,12 @@ object Game {
     }
   }
 
-  class Over(val winner: Option[Player]) extends Game {
+  class Over(val winner: Option[Player], val field: IndexedSeq[IndexedSeq[Option[Player]]]) extends Game {
     val loser = winner.map( _.reverse )
   }
 
   def apply(n: Int): Game = new On(Crosses, IndexedSeq.fill(n, n)(None))
+
 }
 
 sealed trait Player {
