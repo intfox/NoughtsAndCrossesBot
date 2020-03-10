@@ -82,4 +82,6 @@ object NoughtAndCrossesService {
     object Lose extends GameResult
     object Draw extends GameResult
   }
+
+  def apply[F[_] : Concurrent]: F[NoughtAndCrossesService[F, GameInfoImpl[F]]] = Ref.of[F, Option[Deferred[F, GameInfoImpl[F]]]](None).map( new NoughtAndCrossesServiceImpl[F](_) )
 }
